@@ -131,9 +131,7 @@ std::vector<struct mmsghdr>& UDPOutputMessages::GetMessages(unsigned int key) {
     return messages[key];
 }
 void UDPOutputMessages::clearMessages() {
-    for (auto& m : messages) {
-        m.second.clear();
-    }
+    messages.clear();  // Clear the entire map, not just the vectors
     messageOrder.clear();
 }
 void UDPOutputMessages::clearSockets() {
