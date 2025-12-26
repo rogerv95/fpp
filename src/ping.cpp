@@ -129,9 +129,9 @@ public:
         ipad >>= 16;
         ipad &= 0xFFFF;
         icp->icmp_seq = ipad; /* seq and id must be reflected */
-        // Use fixed ID 0x0001 for compatibility with ArtNet controllers that don't properly
-        // implement ICMP and always respond with ID 0x0001 regardless of request ID
-        icp->icmp_id = htons(0x0001);
+        // Use fixed ID 1 (0x0001 in network byte order) for compatibility with ArtNet controllers
+        // that don't properly implement ICMP and always respond with ID 0x0001 regardless of request ID
+        icp->icmp_id = 1;
 
         int cc = DEFDATALEN + ICMP_MINLEN;
         in_cksum(icp, cc);
@@ -141,7 +141,7 @@ public:
         icp->icmp_code = 0;
         icp->icmp_cksum = 0;
         // Restore the fixed ID for ArtNet controller compatibility
-        icp->icmp_id = htons(0x0001);
+        icp->icmp_id = 1;
         icp->icmp_seq = ipad;
     }
     void revalidate() {
