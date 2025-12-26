@@ -129,7 +129,9 @@ public:
         ipad >>= 16;
         ipad &= 0xFFFF;
         icp->icmp_seq = ipad; /* seq and id must be reflected */
-        icp->icmp_id = std::rand() & 0xFF;
+        // Use fixed ID 0x0001 for compatibility with ArtNet controllers that don't properly
+        // implement ICMP and always respond with ID 0x0001 regardless of request ID
+        icp->icmp_id = 0x0001;
 
         int cc = DEFDATALEN + ICMP_MINLEN;
         in_cksum(icp, cc);
