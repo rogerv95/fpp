@@ -140,6 +140,9 @@ public:
         icp->icmp_type = ICMP_ECHO;
         icp->icmp_code = 0;
         icp->icmp_cksum = 0;
+        // Restore the fixed ID for ArtNet controller compatibility
+        icp->icmp_id = 0x0001;
+        icp->icmp_seq = ipad;
     }
     void revalidate() {
         if (!valid) {
