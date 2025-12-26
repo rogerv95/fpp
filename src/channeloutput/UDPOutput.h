@@ -52,6 +52,8 @@ public:
 private:
     std::map<unsigned int, std::vector<struct mmsghdr>> messages;
     std::map<unsigned int, SendSocketInfo*> sendSockets;
+    // Track insertion order for messages to ensure outputs are sent in config order
+    std::vector<unsigned int> messageOrder;
 
     void clearMessages();
     void clearSockets();

@@ -24,6 +24,7 @@
 #include <netdb.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <curl/curl.h>
 #include <set>
 
@@ -120,12 +121,20 @@ void UDPOutputMessages::ForceSocket(unsigned int key, int socket, bool preventCl
     info->sockets.push_back(socket);
 }
 std::vector<struct mmsghdr>& UDPOutputMessages::GetMessages(unsigned int key) {
+    // Track insertion order to preserve config file ordering
+    // Check if this is a new key before accessing the map (to avoid creating empty entry)
+    auto it = messages.find(key);
+    if (it == messages.end()) {
+        // New key - add to order tracking
+        messageOrder.push_back(key);
+    }
     return messages[key];
 }
 void UDPOutputMessages::clearMessages() {
     for (auto& m : messages) {
         m.second.clear();
     }
+    messageOrder.clear();
 }
 void UDPOutputMessages::clearSockets() {
     for (auto& si : sendSockets) {
@@ -640,92 +649,87 @@ int UDPOutput::SendData(unsigned char* channelData) {
     }
     std::chrono::high_resolution_clock clock;
     if (useThreadedOutput) {
-        doneWorkCount = 0;
-        int total = 0;
+        // Send one controller at a time to avoid interleaving packets between controllers
+        // This matches xLights behavior and reduces network switch load
         auto t1 = clock.now();
-        for (auto& msgs : messages.messages) {
-            if (!msgs.second.empty() && msgs.first < LATE_MESSAGES_START) {
-                SendSocketInfo* socketInfo = findOrCreateSocket(msgs.first);
-                std::unique_lock<std::mutex> lock(workMutex);
-                workQueue.push_back(WorkItem(msgs.first, socketInfo, msgs.second));
-                lock.unlock();
-                workSignal.notify_one();
-                ++total;
-            }
-        }
-        std::unique_lock<std::mutex> lock(workMutex);
-        while (numWorkThreads < workQueue.size()) {
-            std::thread(DoWorkThread, this).detach();
-            numWorkThreads++;
-        }
-        if (workQueue.size()) {
-            workSignal.notify_all();
-        }
-        lock.unlock();
-        auto t2 = clock.now();
-        while (doneWorkCount != total && std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() < 50) {
-            std::this_thread::sleep_for(std::chrono::microseconds(250));
-            t2 = clock.now();
-        }
-        if (doneWorkCount == total) {
-#ifndef PLATFORM_OSX
-            // now make sure the buffers are drained for the early packets do that they are
-            // fully received before we send the late packets
-            for (auto& msgs : messages.messages) {
-                if (!msgs.second.empty() && msgs.first < LATE_MESSAGES_START) {
-                    int bytes_in_buffer = 0;
-                    SendSocketInfo* socketInfo = findOrCreateSocket(msgs.first);
-                    int sendSocket = socketInfo->sockets[socketInfo->curSocket];
-                    flushBuffers(sendSocket, msgs.second.size(), msgs.second.size());
+        // Iterate in insertion order (config file order) instead of map key order
+        for (unsigned int key : messages.messageOrder) {
+            auto it = messages.messages.find(key);
+            if (it != messages.messages.end() && !it->second.empty() && key < LATE_MESSAGES_START) {
+                SendSocketInfo* socketInfo = findOrCreateSocket(key);
+                // Send this controller's packets immediately and wait for completion
+                // before moving to the next controller
+                auto t2 = clock.now();
+                int outputCount = SendMessages(key, socketInfo, it->second);
+                auto t3 = clock.now();
+                long diff = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+                if ((outputCount != it->second.size()) || (diff > 100)) {
+                    socketInfo->errCount++;
+                    LogErr(VB_CHANNELOUT, "%s() failed for UDP output (IP: %s   output count: %d/%d   time: %u ms    errCount: %d) with error: %d   %s\n",
+                           blockingOutput ? "sendmsg" : "sendmmsg", HexToIP(key).c_str(),
+                           outputCount, it->second.size(), diff, socketInfo->errCount,
+                           errno,
+                           strerror(errno));
+                } else {
+                    socketInfo->errCount = 0;
                 }
             }
+        }
+#ifndef PLATFORM_OSX
+        // Flush buffers to ensure all data packets are sent before sync packets
+        for (unsigned int key : messages.messageOrder) {
+            auto it = messages.messages.find(key);
+            if (it != messages.messages.end() && !it->second.empty() && key < LATE_MESSAGES_START) {
+                SendSocketInfo* socketInfo = findOrCreateSocket(key);
+                int sendSocket = socketInfo->sockets[socketInfo->curSocket];
+                flushBuffers(sendSocket, it->second.size(), it->second.size());
+            }
+        }
 #endif
-            // now output the LATE/Broadcast packets (likely sync packets)
-            for (auto& msgs : messages.messages) {
-                if (!msgs.second.empty()) {
-                    SendSocketInfo* socketInfo = findOrCreateSocket(msgs.first);
-                    if (msgs.first >= LATE_MESSAGES_START) {
-                        t1 = clock.now();
-                        int outputCount = SendMessages(msgs.first, socketInfo, msgs.second);
-                        t2 = clock.now();
-                        long diff = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-                        if ((outputCount != msgs.second.size()) || (diff > 100)) {
-                            socketInfo->errCount++;
-
-                            // failed to send all messages or it took more than 100ms to send them
-                            LogErr(VB_CHANNELOUT, "sendmmsg() failed for UDP output (IP: %s   output count: %d/%d   time: %u ms    errCount: %d) with error: %d   %s\n",
-                                   HexToIP(msgs.first).c_str(),
-                                   outputCount, msgs.second.size(), diff, socketInfo->errCount,
-                                   errno,
-                                   strerror(errno));
-                        } else {
-                            socketInfo->errCount = 0;
-                        }
-                    }
-                    if (socketInfo->errCount >= 3) {
-                        // we'll ping the controllers and rebuild the valid message list, this could take time
-                        PingControllers(false);
-                        socketInfo->errCount = 0;
-                    }
+        // Now output the LATE/Broadcast packets (likely sync packets)
+        // Iterate in insertion order (config file order)
+        for (unsigned int key : messages.messageOrder) {
+            auto it = messages.messages.find(key);
+            if (it != messages.messages.end() && !it->second.empty() && key >= LATE_MESSAGES_START) {
+                SendSocketInfo* socketInfo = findOrCreateSocket(key);
+                auto t3 = clock.now();
+                int outputCount = SendMessages(key, socketInfo, it->second);
+                auto t4 = clock.now();
+                long diff = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+                if ((outputCount != it->second.size()) || (diff > 100)) {
+                    socketInfo->errCount++;
+                    LogErr(VB_CHANNELOUT, "sendmmsg() failed for UDP output (IP: %s   output count: %d/%d   time: %u ms    errCount: %d) with error: %d   %s\n",
+                           HexToIP(key).c_str(),
+                           outputCount, it->second.size(), diff, socketInfo->errCount,
+                           errno,
+                           strerror(errno));
+                } else {
+                    socketInfo->errCount = 0;
+                }
+                if (socketInfo->errCount >= 3) {
+                    PingControllers(false);
+                    socketInfo->errCount = 0;
                 }
             }
         }
         return 1;
     }
-    for (auto& msgs : messages.messages) {
-        if (!msgs.second.empty()) {
-            SendSocketInfo* socketInfo = findOrCreateSocket(msgs.first);
+    // Non-threaded output: iterate in insertion order (config file order)
+    for (unsigned int key : messages.messageOrder) {
+        auto it = messages.messages.find(key);
+        if (it != messages.messages.end() && !it->second.empty()) {
+            SendSocketInfo* socketInfo = findOrCreateSocket(key);
             auto t1 = clock.now();
-            int outputCount = SendMessages(msgs.first, socketInfo, msgs.second);
+            int outputCount = SendMessages(key, socketInfo, it->second);
             auto t2 = clock.now();
             long diff = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-            if ((outputCount != msgs.second.size()) || (diff > 100)) {
+            if ((outputCount != it->second.size()) || (diff > 100)) {
                 socketInfo->errCount++;
 
                 // failed to send all messages or it took more than 100ms to send them
                 LogErr(VB_CHANNELOUT, "sendmmsg() failed for UDP output (IP: %s   output count: %d/%d   time: %u ms    errCount: %d) with error: %d   %s\n",
-                       HexToIP(msgs.first).c_str(),
-                       outputCount, msgs.second.size(), diff, socketInfo->errCount,
+                       HexToIP(key).c_str(),
+                       outputCount, it->second.size(), diff, socketInfo->errCount,
                        errno,
                        strerror(errno));
 
