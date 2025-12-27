@@ -272,7 +272,9 @@ public:
                         int ipadf = from.sin_addr.s_addr;
                         for (auto t : targets) {
                             int ipad = t->to.sin_addr.s_addr;
-                            if (t->icp->icmp_seq == icp->icmp_seq && ipad == ipadf && icp->icmp_id == t->icp->icmp_id) {
+                            // For ArtNet controllers with broken ICMP: match on IP and ID only, ignore sequence
+                            // since some controllers always respond with a fixed sequence number
+                            if (ipad == ipadf && icp->icmp_id == t->icp->icmp_id) {
                                 toCall.push_back(t);
                                 toRemove.push_back(t);
                             }
